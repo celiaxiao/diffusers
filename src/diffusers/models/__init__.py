@@ -25,6 +25,7 @@ if is_torch_available():
     from .unet_2d import UNet2DModel
     from .unet_2d_condition import UNet2DConditionModel
     from .vq_model import VQModel
+    from .unet_1d_temporal import TemporalUnet, ValueFunction
 
 if is_flax_available():
     from .unet_2d_condition_flax import FlaxUNet2DConditionModel
