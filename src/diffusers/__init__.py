@@ -43,6 +43,8 @@ else:
         VQModel,
         TemporalUnet,
         ValueFunction,
+        SlotFormer,
+        Transformer1DModel,
     )
     from .optimization import (
         get_constant_schedule,
