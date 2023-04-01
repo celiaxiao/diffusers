@@ -1,2 +1,2 @@
 from .value_guided_sampling import ValueGuidedRLPipeline
-from .diffuser_sample import ValueGuidedPipeline
+from .diffuser_sample import ValueGuidedPipeline, ValueGuidedSlotsPipeline

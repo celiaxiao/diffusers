@@ -27,7 +27,7 @@ if is_torch_available():
     from .vq_model import VQModel
     from .unet_1d_temporal import TemporalUnet, ValueFunction
     from .slotformer import SlotFormer
-    from .transformer_1d import Transformer1DModel
+    from .transformer_1d import Transformer1DModel, SlotTransformer1DModel
 
 if is_flax_available():
     from .unet_2d_condition_flax import FlaxUNet2DConditionModel

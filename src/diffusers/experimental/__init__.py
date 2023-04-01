@@ -1,1 +1,1 @@
-from .rl import ValueGuidedRLPipeline, ValueGuidedPipeline
+from .rl import ValueGuidedRLPipeline, ValueGuidedPipeline, ValueGuidedSlotsPipeline

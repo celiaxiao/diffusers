@@ -371,6 +371,66 @@ class Transformer1DModel(ModuleAttrMixin, ModelMixin, ConfigMixin,):
         # (B,T,n_out)
         return x
 
+class SlotTransformer1DModel(Transformer1DModel):
+    def __init__(self, 
+                num_slots: int, 
+                input_dim: int, # per object action_dim + obs_dim
+                action_dim: int, # per object action dim
+                slot_size: int = 128,
+                n_emb: int = 768,
+                *args, **kwargs,
+                ) -> None:
+        super().__init__(input_dim=input_dim * num_slots, n_emb=n_emb, *args, **kwargs)
+        self.num_slots = num_slots
+        self.slot_size = slot_size
+        self.action_dim = action_dim
+        
+        assert input_dim > action_dim
+        # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
+        self.in_proj = nn.Sequential(
+            nn.Linear(input_dim - action_dim, slot_size),
+            nn.Flatten(start_dim=2)
+        )
+
+        # [B, H, N * slot_size]  -> [B, H, N, D]
+        self.out_proj = nn.Linear(slot_size, input_dim - action_dim)
+        # [B, H, N * (slot_size + act_dim)] -> [B, H, n_emb]
+        self.input_emb = nn.Linear(num_slots * (slot_size + action_dim), n_emb)
+        self.head = nn.Linear(n_emb, num_slots * (slot_size + action_dim))
+    
+    def forward(self, 
+        sample: torch.Tensor, 
+        cond: Optional[torch.Tensor]=None, 
+        timestep: Union[torch.Tensor, float, int] = 0, 
+        **kwargs):
+        """
+        sample: [B, horizon, num_slots, input_dim]
+        timestep: (B,) or int, diffusion step
+        cond: (B,T',cond_dim)
+        output: [B, horizon, num_slots, input_dim]
+        """
+
+        slots = sample[:, :, :, self.action_dim:]
+        actions = sample[:, :, :, :self.action_dim].flatten(start_dim=2)
+        # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
+        slots = self.in_proj(slots)
+        # [B, H, N * (slot_size + act_dim)]
+        x = torch.cat([actions, slots], dim=-1)
+        # [B, H, n_emb]
+        x = super().forward(x, cond, timestep, **kwargs)
+        # [B, H, n_emb] -> [B, H, N * (slot_size + act_dim)]
+        # [B, H, N * (slot_size + act_dim)] -> [B, H, N, slot_size + act_dim]
+        x = x.reshape(x.shape[0], x.shape[1], self.num_slots, -1)
+        slots = x[:, :, :, self.action_dim:]
+        actions = x[:, :, :, :self.action_dim]
+        # [B, H, N, slot_size] -> [B, H, N, D]
+        slots = self.out_proj(slots)
+        # [B, H, N, input_dim]
+        x = torch.cat([actions, slots], dim=-1)
+        return x
+        
+
+
 
 def test():
     # GPT with time embedding
@@ -443,3 +503,4 @@ def test():
     timestep = torch.tensor(0)
     sample = torch.zeros((4,8,16))
     out = transformer(sample, timestep)
+
