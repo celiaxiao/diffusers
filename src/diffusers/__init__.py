@@ -46,6 +46,7 @@ else:
         SlotFormer,
         Transformer1DModel,
         SlotTransformer1DModel,
+        SlotTransformerModel,
     )
     from .optimization import (
         get_constant_schedule,

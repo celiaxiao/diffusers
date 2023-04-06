@@ -6,6 +6,7 @@ import torch.nn as nn
 from diffusers.configuration_utils import ConfigMixin
 
 from diffusers.models.modeling_utils import ModelMixin
+from diffusers.models.slotEncoderDecoder import TrajectoryToSlotEncoderDecoder, TrajectoryToSlotWithExtraTokenEncoder
 class SinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super().__init__()
@@ -221,78 +222,7 @@ class Transformer1DModel(ModuleAttrMixin, ModelMixin, ConfigMixin,):
         else:
             raise RuntimeError("Unaccounted module {}".format(module))
     
-    def get_optim_groups(self, weight_decay: float=1e-3):
-        """
-        This long function is unfortunately doing something very simple and is being very defensive:
-        We are separating out all parameters of the model into two buckets: those that will experience
-        weight decay for regularization and those that won't (biases, and layernorm/embedding weights).
-        We are then returning the PyTorch optimizer object.
-        """
 
-        # separate out all parameters to those that will and won't experience regularizing weight decay
-        decay = set()
-        no_decay = set()
-        whitelist_weight_modules = (torch.nn.Linear, torch.nn.MultiheadAttention)
-        blacklist_weight_modules = (torch.nn.LayerNorm, torch.nn.Embedding)
-        for mn, m in self.named_modules():
-            for pn, p in m.named_parameters():
-                fpn = "%s.%s" % (mn, pn) if mn else pn  # full param name
-
-                if pn.endswith("bias"):
-                    # all biases will not be decayed
-                    no_decay.add(fpn)
-                elif pn.startswith("bias"):
-                    # MultiheadAttention bias starts with "bias"
-                    no_decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, whitelist_weight_modules):
-                    # weights of whitelist modules will be weight decayed
-                    decay.add(fpn)
-                elif pn.endswith("weight") and isinstance(m, blacklist_weight_modules):
-                    # weights of blacklist modules will NOT be weight decayed
-                    no_decay.add(fpn)
-
-        # special case the position embedding parameter in the root GPT module as not decayed
-        no_decay.add("pos_emb")
-        no_decay.add("_dummy_variable")
-        if self.cond_pos_emb is not None:
-            no_decay.add("cond_pos_emb")
-
-        # validate that we considered every parameter
-        param_dict = {pn: p for pn, p in self.named_parameters()}
-        inter_params = decay & no_decay
-        union_params = decay | no_decay
-        assert (
-            len(inter_params) == 0
-        ), "parameters %s made it into both decay/no_decay sets!" % (str(inter_params),)
-        assert (
-            len(param_dict.keys() - union_params) == 0
-        ), "parameters %s were not separated into either decay/no_decay set!" % (
-            str(param_dict.keys() - union_params),
-        )
-
-        # create the pytorch optimizer object
-        optim_groups = [
-            {
-                "params": [param_dict[pn] for pn in sorted(list(decay))],
-                "weight_decay": weight_decay,
-            },
-            {
-                "params": [param_dict[pn] for pn in sorted(list(no_decay))],
-                "weight_decay": 0.0,
-            },
-        ]
-        return optim_groups
-
-
-    def configure_optimizers(self, 
-            learning_rate: float=1e-4, 
-            weight_decay: float=1e-3,
-            betas: Tuple[float, float]=(0.9,0.95)):
-        optim_groups = self.get_optim_groups(weight_decay=weight_decay)
-        optimizer = torch.optim.AdamW(
-            optim_groups, lr=learning_rate, betas=betas
-        )
-        return optimizer
 
     def forward(self, 
         sample: torch.Tensor, 
@@ -428,8 +358,81 @@ class SlotTransformer1DModel(Transformer1DModel):
         # [B, H, N, input_dim]
         x = torch.cat([actions, slots], dim=-1)
         return x
-        
 
+def get_sin_pos_enc(seq_len, d_model):
+    """Sinusoid absolute positional encoding."""
+    inv_freq = 1. / (10000**(torch.arange(0.0, d_model, 2.0) / d_model))
+    pos_seq = torch.arange(seq_len - 1, -1, -1).type_as(inv_freq)
+    sinusoid_inp = torch.outer(pos_seq, inv_freq)
+    pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+    return pos_emb.unsqueeze(0)  # [1, L, C]
+        
+class SlotTransformerModel(Transformer1DModel):
+    def __init__(self, 
+                num_slots: int, 
+                input_dim: int, # per object action_dim + obs_dim
+                action_dim: int, # per object action dim
+                extra_dim: int = 0, # extra information dimemsion contained in the observation
+                slot_size: int = 128,
+                n_emb: int = 768,
+                alpha: float = 1.0,
+                *args, **kwargs,
+                ) -> None:
+        super().__init__(input_dim=input_dim, n_emb=n_emb, *args, **kwargs)
+        self.num_slots = num_slots
+        self.slot_size = slot_size
+        self.action_dim = action_dim
+        self.extra_dim = extra_dim
+        assert extra_dim > 0
+        
+        assert input_dim > action_dim
+        if extra_dim == 0:
+            self.slot_encoder_decoder = TrajectoryToSlotEncoderDecoder(
+                input_dim=input_dim,
+                action_dim=action_dim,
+                slot_size=slot_size,
+                num_slots=num_slots,
+                alpha=alpha,
+            )
+        else:
+            self.slot_encoder_decoder = TrajectoryToSlotWithExtraTokenEncoder(
+                input_dim=input_dim,
+                action_dim=action_dim,
+                extra_dim=extra_dim,
+                slot_size=slot_size,
+                num_slots=num_slots,
+                alpha=alpha,
+            )
+            # extra token is another slot
+            num_slots += 1
+        # [B, H, N * slot_size + act_dim] -> [B, H, n_emb]
+        self.input_emb = nn.Sequential(
+            nn.Linear(num_slots * slot_size + action_dim, n_emb),
+            nn.Flatten(start_dim=2)
+        )
+        self.head = nn.Sequential(
+            nn.Linear(n_emb, num_slots * slot_size + action_dim),
+            nn.Flatten(start_dim=2)
+        )
+    
+    def forward(self, 
+        sample: torch.Tensor, 
+        cond: Optional[torch.Tensor]=None, 
+        timestep: Union[torch.Tensor, float, int] = 0, 
+        alpha: float = 1.0,
+        **kwargs):
+        """
+        sample: [B, horizon, input_dim + extra_dim]
+        timestep: (B,) or int, diffusion step
+        cond: (B,T',cond_dim)
+        output: [B, horizon, input_dim + extra_dim]
+        """
+        x = self.slot_encoder_decoder.encode(sample)
+        # [B, H, (N * slot_size) + act_dim]
+        x = super().forward(x, cond, timestep, **kwargs)
+        
+        x = self.slot_encoder_decoder.decode(x)
+        return x
 
 
 def test():

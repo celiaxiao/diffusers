@@ -75,6 +75,9 @@ class ValueGuidedPipeline(DiffusionPipeline):
         #         pass
         self.state_dim = env_stat.observation_dim
         self.action_dim = env_stat.action_dim
+        # TODO:
+        self.state_dim = 16
+
     def normalize(self, x_in, key):
         return self.normalizer.normalize(x_in, key=key)
         # return (x_in - self.means[key]) / self.stds[key]
