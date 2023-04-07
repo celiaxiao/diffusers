@@ -325,7 +325,7 @@ class SlotTransformerModel(Transformer1DModel):
         self.slot_size = slot_size
         self.action_dim = action_dim
         self.extra_dim = extra_dim
-        self.alpha = alpha
+        self.alpha = alphas
 
         assert input_dim > action_dim
         # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
