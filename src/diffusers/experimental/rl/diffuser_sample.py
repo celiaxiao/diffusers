@@ -120,8 +120,8 @@ class ValueGuidedPipeline(DiffusionPipeline):
                 x = x.detach()
                 x = x + scale * grad_token
                 x = self.reset_x0(x, conditions, self.action_dim)
-
-            prev_x = self.unet(x, conditions, timesteps)
+            with torch.no_grad():
+                prev_x = self.unet(x, conditions, timesteps)
 
             # TODO: verify deprecation of this kwarg
             x = self.scheduler.step(prev_x, i, x,
@@ -190,6 +190,68 @@ class ValueGuidedSlotsPipeline(ValueGuidedPipeline):
         num_objects = obs.shape[0]
         obs = obs[None].repeat(batch_size, axis=0)
         conditions = {0: self.to_torch(obs)}
+        shape = (batch_size, self.planning_horizon, num_objects, self.state_dim + self.action_dim)
+
+        # generate initial noise and apply our conditions (to make the trajectories start at current state)
+        x1 = randn_tensor(shape, device=self.unet.device)
+        x = self.reset_x0(x1, conditions, self.action_dim)
+        x = self.to_torch(x)
+
+        # run the diffusion process [B, H, N, state_dim + action_dim]
+        x, y = self.run_diffusion(x, conditions, self.n_guide_steps, self.scale)
+        # sort output trajectories by value
+        if y is not None:
+            sorted_idx = y.argsort(0, descending=True).squeeze()
+            sorted_values = x[sorted_idx]
+        else: # use the first output if we're not using guided steps
+            sorted_values = x
+        # [B, H, N, action_dim + state_dim] -> [B, H, N, action_dim ]
+        actions = sorted_values[:, :, :, : self.action_dim]
+        actions = actions.detach().cpu().numpy()
+        denorm_actions = self.de_normalize(actions, key="actions")
+
+        # select the action with the highest value
+        if y is not None:
+            selected_index = 0
+        else:
+            # if we didn't run value guiding, select a random action
+            selected_index = np.random.randint(0, batch_size)
+        denorm_actions = denorm_actions[selected_index, 0]
+        return denorm_actions, sorted_values
+
+class ValueGuidedHistoryPipeline(ValueGuidedPipeline):
+    def __init__(
+        self, history_len=1,
+        *args, **kwargs
+    ):
+        super().__init__(*args, **kwargs)
+        self.history_len = history_len
+    
+    def get_conditions(self, observations, actions):
+        '''
+            condition on current observation for planning
+        '''
+        # condition on the history_len observations
+        condition = {}
+        for i in range(self.history_len):
+            condition[i] = np.concatenate([actions[i], observations[i]], axis=-1)
+        return condition
+
+    def reset_x0(self, x_in, cond, act_dim):
+        for key, val in cond.items():
+            x_in[:, key] = val.clone()
+        return x_in
+
+    def __call__(self, obs, batch_size=64):
+        '''
+        obs: (batch_size, num_slots, state_dim)
+        '''
+        # normalize the observations and create  batch dimension
+        obs = self.normalize(obs, "observations")
+        # TODO: used for token pipeline only
+        num_objects = obs.shape[0]
+        obs = obs[None].repeat(batch_size, axis=0)
+        conditions = self.get_conditions(obs)
         shape = (batch_size, self.planning_horizon, num_objects, self.state_dim + self.action_dim)
 
         # generate initial noise and apply our conditions (to make the trajectories start at current state)

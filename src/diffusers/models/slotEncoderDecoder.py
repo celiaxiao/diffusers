@@ -34,14 +34,19 @@ class TrajectoryToSlotEncoder(SlotEncoder):
                 in_dim: int, 
                 slot_size: int = 128,
                 alpha: float = 1.0, # positional encoding scaling, 0 for no positional encoding
+                pos_emb_type='sin', # 'sin' or 'learned'
                 ):
         super().__init__(num_slots, slot_size, in_dim)
         self.in_proj = nn.Sequential(
             nn.Linear(in_dim, slot_size),
             nn.Flatten(start_dim=2)
         )
-        self.slots_emb = nn.Parameter(
-            get_sin_pos_enc(num_slots, slot_size), requires_grad=False)
+        if pos_emb_type == 'sin':
+            self.slots_emb = nn.Parameter(
+                get_sin_pos_enc(num_slots, slot_size), requires_grad=False)
+        else:
+            self.slots_emb = nn.Parameter(
+                torch.zeros(num_slots, slot_size), requires_grad=True)
         self.alpha = alpha
     
     def forward(self, x):
@@ -99,6 +104,9 @@ class TrajectoryToSlotEncoderDecoder(nn.Module):
                                                input_dim - action_dim,  
                                                slot_size)
         self.action_dim = action_dim
+        self.slot_size = slot_size
+        self.input_dim = input_dim
+        self.num_slots = num_slots
 
     def encode(self, x):
         slots = x[:, :, self.action_dim:]
@@ -124,18 +132,20 @@ class TrajectoryToSlotWithExtraTokenEncoder(TrajectoryToSlotEncoderDecoder):
                 slot_size: int = 128,
                 alpha: float = 1.0, # positional encoding scaling, 0 for no positional encoding
                 ):
-        super().__init__(num_slots, slot_size, input_dim)
+        super().__init__(num_slots=num_slots, slot_size=slot_size, input_dim=input_dim, action_dim=action_dim)
         self.encoder = TrajectoryToSlotEncoder(num_slots, 
                                                input_dim - action_dim,  
                                                slot_size, 
-                                               alpha)
+                                               alpha,
+                                               pos_emb_type='sin')
         self.decoder = TrajectoryToSlotDecoder(num_slots, 
                                                input_dim - action_dim, 
                                                slot_size)
         self.extra_encoder = TrajectoryToSlotEncoder(1, 
                                                extra_dim, 
                                                slot_size, 
-                                               alpha)
+                                               alpha,
+                                               pos_emb_type='learned')
         self.extra_decoder = TrajectoryToSlotDecoder(1, 
                                                extra_dim, 
                                                slot_size)
@@ -144,7 +154,7 @@ class TrajectoryToSlotWithExtraTokenEncoder(TrajectoryToSlotEncoderDecoder):
     def encode(self, x):
         """
         sample: [B, horizon, input_dim + extra_dim]
-        output: [B, horizon, input_dim + extra_dim]
+        output: [B, horizon, (N + 1) * slot_size + action_dim]
         """
         # [B, H, extra_dim] -> [B, H, 1, extra_dim]
         extra_tokens = x[:, :, -self.extra_dim:]
@@ -159,7 +169,11 @@ class TrajectoryToSlotWithExtraTokenEncoder(TrajectoryToSlotEncoderDecoder):
         return x
     
     def decode(self, x):
-        slots = x[:, :, self.action_dim:]
+        """
+        sample: [B, horizon, (N + 1) * slot_size + action_dim]
+        output: [B, horizon, input_dim + extra_dim]
+        """
+        slots = x[:, :, self.action_dim:].reshape(x.shape[0], x.shape[1], -1, self.slot_size)
         actions = x[:, :, :self.action_dim]
         extra_slots = slots[:, :, -1]
         slots = slots[:, :, :-1]

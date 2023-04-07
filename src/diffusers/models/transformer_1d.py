@@ -301,20 +301,32 @@ class Transformer1DModel(ModuleAttrMixin, ModelMixin, ConfigMixin,):
         # (B,T,n_out)
         return x
 
-class SlotTransformer1DModel(Transformer1DModel):
+def get_sin_pos_enc(seq_len, d_model):
+    """Sinusoid absolute positional encoding."""
+    inv_freq = 1. / (10000**(torch.arange(0.0, d_model, 2.0) / d_model))
+    pos_seq = torch.arange(seq_len - 1, -1, -1).type_as(inv_freq)
+    sinusoid_inp = torch.outer(pos_seq, inv_freq)
+    pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
+    return pos_emb.unsqueeze(0)  # [1, L, C]
+
+class SlotTransformerModel(Transformer1DModel):
     def __init__(self, 
                 num_slots: int, 
                 input_dim: int, # per object action_dim + obs_dim
                 action_dim: int, # per object action dim
+                extra_dim: int, # extra dim
                 slot_size: int = 128,
                 n_emb: int = 768,
+                alphs: float = 1.0,
                 *args, **kwargs,
                 ) -> None:
         super().__init__(input_dim=input_dim * num_slots, n_emb=n_emb, *args, **kwargs)
         self.num_slots = num_slots
         self.slot_size = slot_size
         self.action_dim = action_dim
-        
+        self.extra_dim = extra_dim
+        self.alpha = alpha
+
         assert input_dim > action_dim
         # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
         self.in_proj = nn.Sequential(
@@ -323,10 +335,28 @@ class SlotTransformer1DModel(Transformer1DModel):
         )
 
         # [B, H, N * slot_size]  -> [B, H, N, D]
-        self.out_proj = nn.Linear(slot_size, input_dim - action_dim)
+        self.out_proj = nn.Sequential(
+            nn.Linear(slot_size, input_dim - action_dim),
+            nn.Flatten(start_dim=2)
+        )
+        
+        self.extra_in_proj = nn.Sequential(
+            nn.Linear(extra_dim, slot_size),
+
+        )
+        self.extra_out_proj = nn.Sequential(
+            nn.Linear(slot_size, extra_dim),
+
+        )
+        
+        self.slots_emb = nn.Parameter(
+            get_sin_pos_enc(num_slots, slot_size), requires_grad=False)
+        self.extra_token_emb = nn.Parameter(torch.zeros(1, slot_size), requires_grad=True)
+        # extra token is also a slot
+        num_slots += 1
         # [B, H, N * (slot_size + act_dim)] -> [B, H, n_emb]
-        self.input_emb = nn.Linear(num_slots * (slot_size + action_dim), n_emb)
-        self.head = nn.Linear(n_emb, num_slots * (slot_size + action_dim))
+        self.input_emb = nn.Linear(num_slots * slot_size + action_dim, n_emb)
+        self.head = nn.Linear(n_emb, num_slots * slot_size + action_dim)
     
     def forward(self, 
         sample: torch.Tensor, 
@@ -340,34 +370,47 @@ class SlotTransformer1DModel(Transformer1DModel):
         output: [B, horizon, num_slots, input_dim]
         """
 
-        slots = sample[:, :, :, self.action_dim:]
-        actions = sample[:, :, :, :self.action_dim].flatten(start_dim=2)
+        extra_tokens = sample[:, :, -self.extra_dim:]
+        x = sample[:, :, :-self.extra_dim]
+        slots = x[:, :, self.action_dim:]
+        actions = x[:, :, :self.action_dim]
+        B, H = x.shape[:2]
+        slots = slots.reshape(B, H, self.num_slots, -1)
+        
         # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
         slots = self.in_proj(slots)
+        # encoder positional encoding
+        enc_pe = self.slots_emb.unsqueeze(0).repeat(B, H, 1, 1).flatten(2)
+        slots += enc_pe
+
+        extra_tokens = extra_tokens.unsqueeze(2)        
+        # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
+        extra_tokens = self.extra_in_proj(extra_tokens)
+        # encoder positional encoding
+        enc_pe = self.extra_token_emb.unsqueeze(0).repeat(B, H, 1, 1).flatten(2)
+        extra_tokens += enc_pe
+
+        slots = torch.cat([slots, extra_tokens], dim=2).flatten(2)
         # [B, H, N * (slot_size + act_dim)]
         x = torch.cat([actions, slots], dim=-1)
         # [B, H, n_emb]
         x = super().forward(x, cond, timestep, **kwargs)
-        # [B, H, n_emb] -> [B, H, N * (slot_size + act_dim)]
-        # [B, H, N * (slot_size + act_dim)] -> [B, H, N, slot_size + act_dim]
-        x = x.reshape(x.shape[0], x.shape[1], self.num_slots, -1)
-        slots = x[:, :, :, self.action_dim:]
-        actions = x[:, :, :, :self.action_dim]
+        
+        slots = x[:, :, self.action_dim:].reshape(B, H, -1, self.slot_size)
+        actions = x[:, :, :self.action_dim]
+        extra_slots = slots[:, :, -1]
+        slots = slots[:, :, :-1]
         # [B, H, N, slot_size] -> [B, H, N, D]
+        slots = slots.reshape(B, H, self.num_slots, -1)
+        # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
         slots = self.out_proj(slots)
+        extra_slots = self.extra_out_proj(extra_slots.unsqueeze(2))
+        slots = torch.cat([slots.flatten(2), extra_slots.flatten(2)], dim=-1)
         # [B, H, N, input_dim]
         x = torch.cat([actions, slots], dim=-1)
         return x
-
-def get_sin_pos_enc(seq_len, d_model):
-    """Sinusoid absolute positional encoding."""
-    inv_freq = 1. / (10000**(torch.arange(0.0, d_model, 2.0) / d_model))
-    pos_seq = torch.arange(seq_len - 1, -1, -1).type_as(inv_freq)
-    sinusoid_inp = torch.outer(pos_seq, inv_freq)
-    pos_emb = torch.cat([sinusoid_inp.sin(), sinusoid_inp.cos()], dim=-1)
-    return pos_emb.unsqueeze(0)  # [1, L, C]
         
-class SlotTransformerModel(Transformer1DModel):
+class SlotTransformer1DModel(Transformer1DModel):
     def __init__(self, 
                 num_slots: int, 
                 input_dim: int, # per object action_dim + obs_dim
@@ -419,7 +462,6 @@ class SlotTransformerModel(Transformer1DModel):
         sample: torch.Tensor, 
         cond: Optional[torch.Tensor]=None, 
         timestep: Union[torch.Tensor, float, int] = 0, 
-        alpha: float = 1.0,
         **kwargs):
         """
         sample: [B, horizon, input_dim + extra_dim]
