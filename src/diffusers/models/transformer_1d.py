@@ -317,7 +317,7 @@ class SlotTransformerModel(Transformer1DModel):
                 extra_dim: int, # extra dim
                 slot_size: int = 128,
                 n_emb: int = 768,
-                alphs: float = 1.0,
+                alpha: float = 1.0,
                 *args, **kwargs,
                 ) -> None:
         super().__init__(input_dim=input_dim * num_slots, n_emb=n_emb, *args, **kwargs)
@@ -325,7 +325,7 @@ class SlotTransformerModel(Transformer1DModel):
         self.slot_size = slot_size
         self.action_dim = action_dim
         self.extra_dim = extra_dim
-        self.alpha = alphas
+        self.alpha = alpha
 
         assert input_dim > action_dim
         # [B, H, N, D] -> [B, H, N, slot_size] -> [B, H, N * slot_size]
